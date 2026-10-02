@@ -41,12 +41,20 @@ renumbers seqs or rewrites clocks.
 A third family of endpoints (/api/histories/{id}/import-sessions) stages
 offline events that arrive in several batches into an import session before
 they touch the persistent history.  A session is created empty by history
-ID and accepts event appends with only the per-event checks (fields,
-replica membership, full clock coverage, self component == seq); missing
-predecessors or cross-replica dependencies are tolerated while staging and
-only fail at commit time.  Re-staging an identical event is ignored, the
-same identity with different content is 409, and a session holds at most
-120 distinct events.  Committing merges the staged events into the
+ID and accepts event appends where the per-event checks (fields, replica
+membership, full clock coverage, self component == seq) apply only to
+genuinely new (replica_id, seq) identities; missing predecessors or
+cross-replica dependencies are tolerated while staging and only fail at
+commit time.  A retransmission of an identity already staged or seen
+earlier in the same batch is compared on full content instead: identical
+events (full content including every clock component, key order
+irrelevant) are ignored, while the same replica_id/seq with different key,
+operation, value or clock -- including a missing component, an extra
+component even when its value is 0, or a changed own component -- is 409,
+never 422.  The 120-event session cap counts already-staged identities
+plus the new identities after in-batch deduplication, so 121 identical
+resends stage exactly one event and a full session re-sending its events
+still succeeds.  Committing merges the staged events into the
 history's latest committed state with the original full-equality, causal
 and 120-event rules (content mismatch 409, missing dependencies or other
 violations 422) and closes the session; the merge and the close take effect
@@ -244,6 +252,30 @@ class MergeEventsRequest(BaseModel):
     events: Annotated[
         list[Event],
         Field(min_length=1, max_length=120, description="1-120 events to merge, any order."),
+    ]
+
+
+class StageEventsRequest(BaseModel):
+    """A session append: 1+ raw events, no hard cap on the request length.
+
+    Retransmissions of an already-staged (or earlier-in-batch) identity are
+    deduplicated by full content, so a batch may legitimately carry more than
+    120 raw entries (e.g. 121 identical resends) while staging far fewer
+    distinct events.  The 120-event cap is enforced on the number of distinct
+    identities after deduplication.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    events: Annotated[
+        list[Event],
+        Field(
+            min_length=1,
+            description=(
+                "One or more events to stage, any order; same-identity "
+                "retransmissions are compared by full content and deduplicated."
+            ),
+        ),
     ]
 
 
@@ -687,21 +719,50 @@ def _stage_events(
 ) -> list[Event]:
     """Stage incoming events into an open import session.
 
-    Only the per-event checks apply while staging: the event must belong to
-    one of the history's replicas, its clock must cover exactly all
-    replica_ids, and the clock's own component must equal the event's seq
-    (all 422).  Missing predecessors or cross-replica dependencies are
-    tolerated here and only fail when the session is committed.  Re-staging
-    an identical event (same identity and same full content, including
-    every clock component) is ignored; the same (replica_id, seq) with
-    different content is a 409.  A session stages at most 120 distinct
-    events.  Either the whole append applies or nothing does.
+    The per-event checks (unknown replica, clock must cover exactly all
+    replica_ids, own clock component == seq; all 422) apply only to
+    *genuinely new* (replica_id, seq) identities -- the first occurrence of
+    an identity that is not already staged.  Missing predecessors or
+    cross-replica dependencies of such events are tolerated here and only
+    fail when the session is committed.
+
+    A *retransmission* -- an identity already staged, or seen earlier in this
+    same batch -- does not go through the per-event checks at all; a missing
+    clock component, an extra component (even one with value 0) or a changed
+    own component on a retransmitted identity is therefore never a 422.
+    Retransmissions are compared by full content (key, operation kind, value
+    and the *complete* clock; clock key order is irrelevant): identical
+    content is ignored, different content is a 409 (event_content_mismatch)
+    pointing at the offending batch index.
+
+    The session stages at most 120 distinct identities: the cap counts
+    already-staged identities plus the genuinely new identities after
+    in-batch deduplication, so e.g. 121 identical resends of one legal event
+    stage exactly one and a full (120-event) session re-sending its events
+    still succeeds.  Either the whole append applies or nothing does.
     """
 
     replica_set = set(replica_ids)
 
+    # Resolve every incoming identity against what is already staged and the
+    # earlier entries of this same batch; only the first occurrence of an
+    # identity that is not already staged is treated as genuinely new.
+    staged_by_id = {(ev.replica_id, ev.seq): ev for ev in staged}
+    seen_new: set[tuple[str, int]] = set()
+    new_identity: list[bool] = []
+    for ev in incoming:
+        ident = (ev.replica_id, ev.seq)
+        is_new = ident not in staged_by_id and ident not in seen_new
+        new_identity.append(is_new)
+        if is_new:
+            seen_new.add(ident)
+
+    # Per-event checks, collected in index order, for genuinely new events
+    # only -- retransmissions are judged by full-content comparison below.
     errors: list[dict] = []
     for i, ev in enumerate(incoming):
+        if not new_identity[i]:
+            continue
         if ev.replica_id not in replica_set:
             errors.append(
                 _err(
@@ -731,8 +792,11 @@ def _stage_events(
     if errors:
         raise BatchError(errors)
 
-    # Coverage is exact from here on, so the self-component lookup is safe.
+    # Own component check for genuinely new events only; those events have
+    # exact coverage from here on, so the self-component lookup is safe.
     for i, ev in enumerate(incoming):
+        if not new_identity[i]:
+            continue
         if ev.clock[ev.replica_id] != ev.seq:
             raise BatchError(
                 [
@@ -745,10 +809,11 @@ def _stage_events(
                 ]
             )
 
-    staged_by_id = {(ev.replica_id, ev.seq): ev for ev in staged}
+    merged_by_id = dict(staged_by_id)
     merged = list(staged)
     for i, ev in enumerate(incoming):
-        prior = staged_by_id.get((ev.replica_id, ev.seq))
+        ident = (ev.replica_id, ev.seq)
+        prior = merged_by_id.get(ident)
         if prior is not None:
             if not _same_event_content(prior, ev):
                 raise ConflictStateError(
@@ -757,8 +822,8 @@ def _stage_events(
                             "code": "event_content_mismatch",
                             "message": (
                                 f"event with replica_id {ev.replica_id!r}, "
-                                f"seq {ev.seq} is already staged in this "
-                                "session with different content; staged "
+                                f"seq {ev.seq} is already present in this "
+                                "session with different content; prior "
                                 f"{_event_wire(prior)!r}, incoming "
                                 f"{_event_wire(ev)!r}"
                             ),
@@ -768,7 +833,7 @@ def _stage_events(
                 )
             # Same identity, identical content -> ignore.
             continue
-        staged_by_id[(ev.replica_id, ev.seq)] = ev
+        merged_by_id[ident] = ev
         merged.append(ev)
 
     if len(merged) > 120:
@@ -1603,16 +1668,21 @@ def commit_history_conflict(history_id: str, body: ConflictDecision) -> dict:
 #
 # Sessions stage offline events that arrive in several batches; the staged
 # events only reach the persistent history when the session is committed.
-# Staging applies the per-event checks only (fields, replica membership,
-# full clock coverage, self component == seq) and tolerates not-yet-arrived
-# predecessors or cross-replica dependencies; commit re-runs the original
-# merge (full-content equality, causal validation, 120-event cap) against
-# the history's latest committed state.  Every mutation runs inside one
-# BEGIN IMMEDIATE transaction together with the history row lock, so a
-# commit serialises with the legacy write endpoints and cannot lose events,
-# the merge and the session close take effect together, and any failure
-# rolls everything back, leaving the open session and its staged events
-# untouched for a retry.
+# Staging applies the per-event checks (fields, replica membership, full
+# clock coverage, own component == seq) to genuinely new identities only and
+# tolerates not-yet-arrived predecessors or cross-replica dependencies;
+# same-identity retransmissions -- against staged events or earlier entries
+# of the same batch -- skip those checks and are judged by full-content
+# equality (identical ignored; a missing component, an extra component even
+# when zero, or a changed component -> 409, never 422).  The 120-event cap
+# counts distinct identities after in-batch deduplication.  Commit re-runs
+# the original merge (full-content equality, causal validation, 120-event
+# cap) against the history's latest committed state.  Every mutation runs
+# inside one BEGIN IMMEDIATE transaction together with the history row lock,
+# so a commit serialises with the legacy write endpoints and cannot lose
+# events, the merge and the session close take effect together, and any
+# failure rolls everything back, leaving the open session and its staged
+# events untouched for a retry.
 # ---------------------------------------------------------------------------
 
 
@@ -1663,15 +1733,22 @@ def read_import_session(history_id: str, session_id: str) -> dict:
     response_model=None,
 )
 def stage_import_session_events(
-    history_id: str, session_id: str, body: MergeEventsRequest
+    history_id: str, session_id: str, body: StageEventsRequest
 ) -> dict:
     """Stage a batch of events into an open session and return its state.
 
-    Per-event checks only (422 on illegal fields, unknown replica, clock
-    coverage or self component); missing dependencies are tolerated until
-    commit.  Identical re-staging is ignored, the same identity with
-    different content is 409, and the 120-distinct-event session limit is
-    422.  A failed append changes nothing; a closed session is 409.
+    Per-event checks (422 on unknown replica, clock coverage or own
+    component) apply only to genuinely new (replica_id, seq) identities;
+    missing dependencies are tolerated until commit.  Retransmissions of an
+    already-staged or earlier-in-batch identity skip those checks and are
+    compared by full content: a missing component, an extra component --
+    even one with value 0 -- or a changed own component is different content
+    and gets 409 (event_content_mismatch, with the batch event_index), never
+    422; identical content is ignored.  The 120-event cap counts already
+    staged identities plus the new identities after in-batch deduplication,
+    so 121 identical resends of one legal event stage one and a full session
+    re-sending its events still succeeds; a distinct identity beyond the cap
+    is 422.  A failed append changes nothing; a closed session is 409.
     """
 
     with store.write_transaction() as conn:

@@ -2171,6 +2171,250 @@ def test_import_session_append_identical_ignored_different_content_409():
     assert r.json()["detail"][0]["event_index"] == 1
 
 
+def assert_session_409(r, expected_index):
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    (err,) = detail
+    assert err["code"] == "event_content_mismatch"
+    assert err["event_index"] == expected_index
+    return err
+
+
+def test_import_session_append_retransmission_bad_clock_is_409_not_422():
+    # Regression: a same-identity retransmission whose clock misses a
+    # component, adds an extra (even zero-valued) component, or changes the
+    # own component must be judged by full-content comparison -> 409, not by
+    # the per-event coverage/self-component checks -> 422.
+    hid = create_conflict_history()
+    sid = create_session(hid)
+    original = ev("r1", 2, "k", put="x", clock={"r1": 2, "r2": 1})
+    assert session_append(hid, sid, [original]).status_code == 200
+    before = session_get(hid, sid).json()
+    hist_before = hist_get(hid).json()
+
+    # Extra component (value 0) -> 409.
+    r = session_append(
+        hid,
+        sid,
+        [ev("r1", 2, "k", put="x", clock={"r1": 2, "r2": 1, "r3": 0})],
+    )
+    assert_session_409(r, 0)
+
+    # Missing component -> 409 (and no KeyError projecting the clock).
+    r = session_append(
+        hid, sid, [ev("r1", 2, "k", put="x", clock={"r1": 2})]
+    )
+    assert_session_409(r, 0)
+
+    # Own component changed (r1 = 3 != seq 2) -> 409, not clock_self_component.
+    r = session_append(
+        hid, sid, [ev("r1", 2, "k", put="x", clock={"r1": 3, "r2": 1})]
+    )
+    assert_session_409(r, 0)
+
+    # Another component value changed -> 409.
+    r = session_append(
+        hid, sid, [ev("r1", 2, "k", put="x", clock={"r1": 2, "r2": 2})]
+    )
+    assert_session_409(r, 0)
+
+    # A legal new event travelling with the mismatched retransmission is not
+    # staged either; the history is untouched as well.
+    r = session_append(
+        hid,
+        sid,
+        [
+            ev("r1", 2, "k", put="x", clock={"r1": 3, "r2": 1}),
+            ev("r2", 2, "other", put="y", clock={"r1": 2, "r2": 2}),
+        ],
+    )
+    assert_session_409(r, 0)
+    assert session_get(hid, sid).json() == before
+    assert hist_get(hid).json() == hist_before
+
+    # A byte-identical retransmission (only clock key order differs) is still
+    # ignored.
+    r = session_append(
+        hid,
+        sid,
+        [
+            {
+                "replica_id": "r1",
+                "seq": 2,
+                "key": "k",
+                "put": "x",
+                "clock": {"r2": 1, "r1": 2},
+            }
+        ],
+    )
+    assert r.status_code == 200, r.text
+    assert session_get(hid, sid).json() == before
+
+
+def test_import_session_append_batch_internal_retransmission_bad_clock_is_409():
+    # Two copies of a brand-new identity inside one append: an extra zero
+    # component (or missing component) on the second copy is a content
+    # mismatch against the earlier copy -> 409, not a 422 coverage error.
+    hid = create_conflict_history()
+    sid = create_session(hid)
+
+    r = session_append(
+        hid,
+        sid,
+        [
+            ev("r1", 2, "k", put="x", clock={"r1": 2, "r2": 1}),
+            ev("r1", 2, "k", put="x", clock={"r1": 2, "r2": 1, "r3": 0}),
+        ],
+    )
+    assert_session_409(r, 1)
+    assert session_get(hid, sid).json()["events"] == []
+
+    r = session_append(
+        hid,
+        sid,
+        [
+            ev("r1", 2, "k", put="x", clock={"r1": 2, "r2": 1}),
+            ev("r1", 2, "k", put="x", clock={"r1": 2}),
+        ],
+    )
+    assert_session_409(r, 1)
+    assert session_get(hid, sid).json()["events"] == []
+
+
+def test_import_session_append_new_identity_still_gets_per_event_422():
+    # The per-event checks still apply to genuinely new identities; missing
+    # dependencies remain tolerated.
+    hid = create_conflict_history()
+    sid = create_session(hid)
+    before = session_get(hid, sid).json()
+
+    # New identity with an illegal clock -> 422 (even though the same clock
+    # shape on a retransmission would be 409).
+    r = session_append(
+        hid, sid, [ev("r1", 2, "k", put="x", clock={"r1": 2, "r2": 1, "r3": 0})]
+    )
+    assert_422(r, "clock_replica_coverage")
+    r = session_append(hid, sid, [ev("r1", 2, "k", put="x", clock={"r1": 2})])
+    assert_422(r, "clock_replica_coverage")
+    r = session_append(
+        hid, sid, [ev("r1", 2, "k", put="x", clock={"r1": 3, "r2": 1})]
+    )
+    assert_422(r, "clock_self_component")
+    r = session_append(
+        hid, sid, [ev("r9", 1, "k", put="x", clock={"r1": 0, "r2": 0})]
+    )
+    assert_422(r, "unknown_replica_id")
+    assert session_get(hid, sid).json() == before
+
+    # 422 (illegal new identity) wins over a 409 (mismatched retransmission)
+    # in the same append, and nothing is staged.
+    r = session_append(
+        hid,
+        sid,
+        [
+            ev("r1", 2, "k", put="x", clock={"r1": 2, "r2": 1, "r3": 0}),
+            ev("r1", 2, "k", put="x", clock={"r1": 3, "r2": 1}),
+        ],
+    )
+    assert_422(r, "clock_replica_coverage")
+    assert session_get(hid, sid).json() == before
+
+
+def test_import_session_append_121_identical_events_stage_one():
+    # A batch may carry more than 120 raw entries: 121 identical copies of
+    # one legal new event deduplicate to a single staged event.
+    hid = create_conflict_history()
+    sid = create_session(hid)
+    one = ev("r1", 2, "k", put="x", clock={"r1": 2, "r2": 1})
+
+    r = session_append(hid, sid, [dict(one) for _ in range(121)])
+    assert r.status_code == 200, r.text
+    assert r.json()["events"] == [one]
+
+    # Mix: 121 copies of the staged event plus 120 copies of one more new
+    # identity -> two distinct events staged, still within the cap.
+    other = ev("r2", 2, "other", put="y", clock={"r1": 2, "r2": 2})
+    r = session_append(
+        hid, sid, [dict(one) for _ in range(121)] + [dict(other) for _ in range(120)]
+    )
+    assert r.status_code == 200, r.text
+    assert [(e["replica_id"], e["seq"]) for e in r.json()["events"]] == [
+        ("r1", 2),
+        ("r2", 2),
+    ]
+
+
+def test_import_session_full_session_retransmissions_still_succeed():
+    # A session holding exactly 120 distinct events accepts another raw
+    # batch that only re-sends (all of) them, even though the batch itself
+    # has 120 entries and one more copy makes it 121 raw entries.
+    hid = hist_create(
+        ["r1", "r2"],
+        [ev("r2", 1, "seed", put="s", clock={"r1": 0, "r2": 1})],
+    ).json()["id"]
+    sid = create_session(hid)
+    staged = [
+        ev("r1", n, "k", put="v", clock={"r1": n, "r2": 0})
+        for n in range(1, 121)
+    ]
+    assert session_append(hid, sid, staged).status_code == 200
+    assert len(session_get(hid, sid).json()["events"]) == 120
+
+    # Re-send all 120, plus one extra copy -> 121 raw entries, all repeats.
+    r = session_append(hid, sid, staged + [dict(staged[0])])
+    assert r.status_code == 200, r.text
+    assert len(r.json()["events"]) == 120
+
+    # A genuinely new identity still exceeds the cap -> 422, even when it
+    # rides along with 121 retransmissions; the append is atomic.
+    r = session_append(
+        hid,
+        sid,
+        [dict(staged[0]) for _ in range(121)]
+        + [ev("r1", 121, "k", put="v", clock={"r1": 121, "r2": 0})],
+    )
+    assert_422(r, "batch_full")
+    assert len(session_get(hid, sid).json()["events"]) == 120
+
+
+def test_import_session_cap_counts_distinct_identities_only():
+    # 119 distinct events staged; an append with one genuinely new identity
+    # duplicated twice reaches exactly 120 distinct -> OK.  One more new
+    # identity (also duplicated) would make 121 distinct -> 422, and the
+    # whole append (including its duplicates) is rejected.
+    hid = hist_create(
+        ["r1", "r2"],
+        [ev("r2", 1, "seed", put="s", clock={"r1": 0, "r2": 1})],
+    ).json()["id"]
+    sid = create_session(hid)
+    first = [
+        ev("r1", n, "k", put="v", clock={"r1": n, "r2": 0})
+        for n in range(1, 120)
+    ]
+    assert session_append(hid, sid, first).status_code == 200
+
+    last = ev("r1", 120, "k", put="v", clock={"r1": 120, "r2": 0})
+    r = session_append(hid, sid, [dict(last), dict(last)])
+    assert r.status_code == 200, r.text
+    assert len(r.json()["events"]) == 120
+
+    overflow = ev("r1", 121, "k", put="v", clock={"r1": 121, "r2": 0})
+    r = session_append(hid, sid, [dict(overflow), dict(overflow)])
+    assert_422(r, "batch_full")
+    assert len(session_get(hid, sid).json()["events"]) == 120
+
+    # 121 distinct identities in a single raw append on an empty session is
+    # likewise rejected by the distinct-identity cap, not accepted.
+    sid2 = create_session(hid)
+    many = [
+        ev("r1", n, "k", put="v", clock={"r1": n, "r2": 0})
+        for n in range(1, 122)
+    ]
+    r = session_append(hid, sid2, many)
+    assert_422(r, "batch_full")
+    assert session_get(hid, sid2).json()["events"] == []
+
+
 def test_import_session_append_enforces_120_distinct_event_limit():
     hid = hist_create(
         ["r1", "r2"],
