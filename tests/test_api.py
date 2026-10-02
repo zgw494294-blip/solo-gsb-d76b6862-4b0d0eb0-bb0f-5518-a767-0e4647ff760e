@@ -2202,6 +2202,219 @@ def test_import_session_append_enforces_120_distinct_event_limit():
     assert len(session_get(hid, sid).json()["events"]) == 120
 
 
+def test_import_session_append_retransmit_clock_divergence_is_409_not_422():
+    # A retransmitted (replica_id, seq) is compared for full content
+    # equality only: a clock that misses a component, carries an extra
+    # zero-valued component or changes any component value is a content
+    # mismatch (409), never a per-event validation failure (422).
+    hid = create_conflict_history()
+    sid = create_session(hid)
+    staged = ev("r1", 2, "k", put="x", clock={"r1": 2, "r2": 1})
+    assert session_append(hid, sid, [staged]).status_code == 200
+
+    divergent_clocks = [
+        {"r1": 2},  # missing component
+        {"r1": 2, "r2": 1, "r3": 0},  # extra zero-valued component
+        {"r1": 3, "r2": 1},  # changed self component
+        {"r1": 2, "r2": 2},  # changed other component
+    ]
+    for clock in divergent_clocks:
+        r = session_append(
+            hid,
+            sid,
+            [
+                ev("r2", 3, "k", put="new", clock={"r1": 2, "r2": 3}),
+                {
+                    "replica_id": "r1",
+                    "seq": 2,
+                    "key": "k",
+                    "put": "x",
+                    "clock": clock,
+                },
+            ],
+        )
+        assert r.status_code == 409, (clock, r.text)
+        (err,) = r.json()["detail"]
+        assert err["code"] == "event_content_mismatch"
+        assert err["event_index"] == 1
+        # The failed append staged nothing: the valid new event riding in
+        # the same batch was not stored either.
+        assert session_get(hid, sid).json()["events"] == [staged]
+
+    # The identical retransmission (clock key order irrelevant) is ignored.
+    r = session_append(
+        hid,
+        sid,
+        [
+            {
+                "replica_id": "r1",
+                "seq": 2,
+                "key": "k",
+                "put": "x",
+                "clock": {"r2": 1, "r1": 2},
+            }
+        ],
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["events"] == [staged]
+
+
+def test_import_session_append_same_batch_duplicate_divergence_is_409():
+    # The first copy of a new identity inside one append is validated; a
+    # later copy with the same identity is a retransmission and only faces
+    # the content comparison -- even when its clock would fail validation.
+    hid = create_conflict_history()
+    sid = create_session(hid)
+
+    r = session_append(
+        hid,
+        sid,
+        [
+            ev("r1", 2, "k", put="x", clock={"r1": 2, "r2": 1}),
+            {
+                "replica_id": "r1",
+                "seq": 2,
+                "key": "k",
+                "put": "x",
+                "clock": {"r1": 2},  # missing component -> 409, not 422
+            },
+        ],
+    )
+    assert r.status_code == 409, r.text
+    (err,) = r.json()["detail"]
+    assert err["code"] == "event_content_mismatch"
+    assert err["event_index"] == 1
+    assert session_get(hid, sid).json()["events"] == []
+
+    # Identical copies of a valid new identity collapse into one staged
+    # event; an invalid *new* identity in the same batch is still 422, and
+    # validation failures win over content mismatches.
+    good = ev("r1", 2, "k", put="x", clock={"r1": 2, "r2": 1})
+    r = session_append(hid, sid, [good, dict(good)])
+    assert r.status_code == 200, r.text
+    assert r.json()["events"] == [good]
+    r = session_append(
+        hid,
+        sid,
+        [
+            ev("r1", 2, "k", put="y", clock={"r1": 2, "r2": 1}),  # 409-worthy
+            ev("r9", 1, "k", put="z", clock={"r1": 0, "r2": 0}),  # 422-worthy
+        ],
+    )
+    assert_422(r, "unknown_replica_id")
+    assert session_get(hid, sid).json()["events"] == [good]
+
+
+def test_import_session_append_121_identical_copies_stage_one_event():
+    # The 120-event capacity counts distinct identities only: already
+    # staged events plus the append's deduplicated new identities.  A
+    # single append may therefore carry more than 120 items when the
+    # extras are retransmissions.
+    hid = create_conflict_history()
+    sid = create_session(hid)
+
+    copies = [
+        ev("r1", 2, "k", put="x", clock={"r1": 2, "r2": 1})
+    ] * 121
+    r = session_append(hid, sid, copies)
+    assert r.status_code == 200, r.text
+    assert r.json()["events"] == [copies[0]]
+    assert session_get(hid, sid).json()["events"] == [copies[0]]
+
+    # Retransmissions of the staged event ride along with genuinely new
+    # identities in the same large append; only the new identities count.
+    bulk = copies[:60] + [
+        ev("r2", n, "k", put="y", clock={"r1": 0, "r2": n})
+        for n in range(2, 60)
+    ]
+    r = session_append(hid, sid, bulk)
+    assert r.status_code == 200, r.text
+    assert len(r.json()["events"]) == 1 + 58
+
+    # 121 *distinct* new identities in one append exceed the capacity.
+    sid2 = create_session(hid)
+    r = session_append(
+        hid,
+        sid2,
+        [
+            ev("r1", n, "k", put="v", clock={"r1": n, "r2": 0})
+            for n in range(1, 122)
+        ],
+    )
+    assert_422(r, "batch_full")
+    assert session_get(hid, sid2).json()["events"] == []
+
+
+def test_import_session_append_full_session_retransmit_still_succeeds():
+    hid = hist_create(
+        ["r1", "r2"],
+        [ev("r2", 1, "seed", put="s", clock={"r1": 0, "r2": 1})],
+    ).json()["id"]
+    sid = create_session(hid)
+    staged = [
+        ev("r1", n, "k", put="v", clock={"r1": n, "r2": 0})
+        for n in range(1, 121)
+    ]
+    assert session_append(hid, sid, staged).status_code == 200
+
+    # A full session still accepts retransmissions of its own events --
+    # even several copies per event in one append.
+    r = session_append(hid, sid, staged[:40] * 3)
+    assert r.status_code == 200, r.text
+    assert len(r.json()["events"]) == 120
+
+    # A full session also accepts retransmissions mixed with divergent
+    # copies: the mismatch is reported and nothing changes.
+    divergent = dict(staged[0])
+    divergent["clock"] = {"r1": 1, "r2": 0, "r3": 0}
+    r = session_append(hid, sid, [staged[1], divergent])
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"][0]["code"] == "event_content_mismatch"
+    assert r.json()["detail"][0]["event_index"] == 1
+    assert len(session_get(hid, sid).json()["events"]) == 120
+
+
+def test_import_session_append_failure_leaves_session_and_history_untouched():
+    hid = create_conflict_history()
+    before = hist_get(hid).json()
+    sid = create_session(hid)
+    staged = ev("r1", 2, "k", put="x", clock={"r1": 2, "r2": 1})
+    assert session_append(hid, sid, [staged]).status_code == 200
+
+    # 409 failure: divergent retransmission.
+    r = session_append(
+        hid,
+        sid,
+        [ev("r1", 2, "k", put="x", clock={"r1": 2, "r2": 1, "r3": 0})],
+    )
+    assert r.status_code == 409, r.text
+    # 422 failure: invalid new identity.
+    r = session_append(
+        hid,
+        sid,
+        [ev("r1", 3, "k", put="y", clock={"r1": 4, "r2": 1})],
+    )
+    assert_422(r, "clock_self_component")
+    # 422 failure: over-capacity distinct identities.
+    r = session_append(
+        hid,
+        sid,
+        [staged]
+        + [
+            ev("r1", n, "k", put="v", clock={"r1": n, "r2": 0})
+            for n in range(3, 123)
+        ],
+    )
+    assert_422(r, "batch_full")
+
+    # Staged events, session status and the committed history are all
+    # exactly as before the failed appends.
+    session = session_get(hid, sid).json()
+    assert session["status"] == "open"
+    assert session["events"] == [staged]
+    assert hist_get(hid).json() == before
+
+
 def test_import_session_commit_returns_history_read_structure_and_closes():
     hid = create_conflict_history()
     sid = create_session(hid)

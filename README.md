@@ -30,11 +30,15 @@
 结果，**不实际删除、不重排序号或时钟、不改动已提交历史**。
 
 最后是一组**导入会话**接口（`/api/histories/{id}/import-sessions`）：离线事件
-分几次到达时，先按历史 ID 开一个空会话，把每批事件**暂存**进去（暂存只校验单
-事件本身，允许前序或跨副本依赖尚未到达），收齐后一次**提交**——提交把暂存事件
-与历史最新已提交状态按原规则合并（完整判等、因果校验、120 条总上限），成功即
-封闭会话。提交失败（缺依赖等）时开放会话与已暂存数据原样保留，补齐后可直接
-重试。会话同样持久化在 SQLite 中，进程/容器重启后可继续暂存与提交。
+分几次到达时，先按历史 ID 开一个空会话，把每批事件**暂存**进去。暂存先做重传
+判等：同 `(replica_id, seq)` 的事件（已暂存或同批重复）只按完整内容判等——完全
+相同忽略，异内容（含 `clock` 缺项、多出零分量、本分量改变）返回 **409** 而非
+422；只有**新标识**事件才校验单事件本身（允许前序或跨副本依赖尚未到达）。120 条
+容量只按不同标识计数，重传不占容量，单批可携带任意多份重传。收齐后一次
+**提交**——提交把暂存事件与历史最新已提交状态按原规则合并（完整判等、因果校验、
+120 条总上限），成功即封闭会话。提交失败（缺依赖等）时开放会话与已暂存数据原样
+保留，补齐后可直接重试。会话同样持久化在 SQLite 中，进程/容器重启后可继续暂存
+与提交。
 
 ## 启动
 
@@ -937,14 +941,18 @@ curl -sS -i -G "http://localhost:8000/api/histories/$HID/withdraw-preview" \
 
 暂存规则（每次追加**全部生效或全部不生效**，失败不改暂存）：
 
-- 只做**单事件**校验：字段合法（`put`/`delete` 二选一等）、副本属于该历史、
-  `clock` 恰好覆盖全部副本、本副本分量等于 `seq`；违例 **422**；
+- **先按 `(replica_id, seq)` 识别重传**：已暂存或同批先出现的同标识事件只做
+  **完整内容判等**（`key`、操作、值与完整 `clock`，键序无关）——完全相同忽略；
+  异内容（含 `clock` 缺项、多出零值分量、本分量或任一分量值改变）返回 **409**
+  （`event_content_mismatch`，带追加批次的 `event_index`），不再做单事件校验；
+- 只有**新标识**事件才做**单事件**校验：字段合法（`put`/`delete` 二选一等）、
+  副本属于该历史、`clock` 恰好覆盖全部副本、本副本分量等于 `seq`；违例 **422**；
 - **允许前序事件或跨副本依赖尚未到达**（连续性、因果、依赖存在性都留到提交时
   检查），事件可按任意顺序、任意批次追加；
-- 按 `(replica_id, seq)` 判等：同标识且**完整内容**相同（含完整 `clock`，键序
-  无关）的重复追加被忽略；同标识异内容 **409**
-  （`event_content_mismatch`，带追加批次的 `event_index`）；
-- 每个会话至多暂存 **120 个不同事件**，超出 **422**（`batch_full`）。
+- 每个会话至多暂存 **120 个不同标识**的事件：容量只计已暂存与本批去重后的新
+  标识，重传不占容量，因此单批可以携带超过 120 条（121 份相同合法事件只存一
+  条，已存满 120 条的会话重传已有事件仍成功）；不同标识超出 120 返回 **422**
+  （`batch_full`）。
 
 提交规则：
 
@@ -1124,6 +1132,81 @@ curl -sS -i -X POST "http://localhost:8000/api/histories/$HID/import-sessions/$S
 暂存期间历史的读取与裁决完全不受会话影响；只有提交成功后，
 `GET /api/histories/{id}` 才会包含汇入的事件。会话与历史一样落在 SQLite
 中，`docker compose restart` 后开放会话可继续暂存与提交。
+
+### 19. 重传判等优先：clock 异内容 409、同内容忽略、重传不占容量
+
+暂存追加先按 `(replica_id, seq)` 识别重传，只做完整内容判等，不做单事件
+校验。新开一个会话并暂存 `r1/2`：
+
+```bash
+SID3=$(curl -sS -X POST "http://localhost:8000/api/histories/$HID/import-sessions" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/import-sessions/$SID3/events" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "events": [
+      {"replica_id": "r1", "seq": 2, "key": "name", "put": "alice2",
+       "clock": {"r1": 2, "r2": 0}}
+    ]
+  }'
+```
+
+重传同一标识但 `clock` 多出零分量（缺项、本分量或任一分量值改变同理）——返回
+**409** 而非 422，且同批其他合法事件也不会暂存：
+
+```bash
+curl -sS -i -X POST "http://localhost:8000/api/histories/$HID/import-sessions/$SID3/events" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "events": [
+      {"replica_id": "r1", "seq": 2, "key": "name", "put": "alice2",
+       "clock": {"r1": 2, "r2": 0, "r3": 0}}
+    ]
+  }'
+```
+
+```json
+{
+  "detail": [
+    {
+      "code": "event_content_mismatch",
+      "message": "event with replica_id 'r1', seq 2 is already staged in this session with different content; staged {...}, incoming {...}",
+      "event_index": 0
+    }
+  ]
+}
+```
+
+内容完全相同的重传（`clock` 键序无关）被忽略；120 条容量只计**不同标识**，
+因此一批 121 份相同合法事件去重后只占 1 条，追加成功、会话里只存一条：
+
+```bash
+python3 -c 'import json; print(json.dumps({"events": [
+    {"replica_id": "r2", "seq": 3, "key": "other", "put": "y",
+     "clock": {"r1": 0, "r2": 3}}
+] * 121}))' | curl -sS -X POST \
+  "http://localhost:8000/api/histories/$HID/import-sessions/$SID3/events" \
+  -H 'Content-Type: application/json' -d @-
+```
+
+```json
+{
+  "id": "9c1f…",
+  "history_id": "f82c…",
+  "status": "open",
+  "events": [
+    {"replica_id": "r1", "seq": 2, "key": "name", "put": "alice2",
+     "clock": {"r1": 2, "r2": 0}},
+    {"replica_id": "r2", "seq": 3, "key": "other", "put": "y",
+     "clock": {"r1": 0, "r2": 3}}
+  ]
+}
+```
+
+同理，已存满 120 条的会话重传已有事件仍返回 200（不新增标识）；只有不同标识
+超过 120 才返回 **422**（`batch_full`）。注意这与旧汇入接口
+`POST /api/histories/{id}/events` 不同：后者单批仍限 120 条。
 
 ## 本地开发（不使用 Docker）
 

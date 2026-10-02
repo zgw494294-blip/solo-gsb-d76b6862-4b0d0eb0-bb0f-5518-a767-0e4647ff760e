@@ -41,20 +41,24 @@ renumbers seqs or rewrites clocks.
 A third family of endpoints (/api/histories/{id}/import-sessions) stages
 offline events that arrive in several batches into an import session before
 they touch the persistent history.  A session is created empty by history
-ID and accepts event appends with only the per-event checks (fields,
-replica membership, full clock coverage, self component == seq); missing
-predecessors or cross-replica dependencies are tolerated while staging and
-only fail at commit time.  Re-staging an identical event is ignored, the
-same identity with different content is 409, and a session holds at most
-120 distinct events.  Committing merges the staged events into the
-history's latest committed state with the original full-equality, causal
-and 120-event rules (content mismatch 409, missing dependencies or other
-violations 422) and closes the session; the merge and the close take effect
-in the same transaction, a failed commit leaves the open session and its
-staged events untouched for a retry, and a closed session rejects further
-appends and commits with 409.  Staging never affects the history reads or
-verdicts, and sessions persist in the same SQLite database, so they survive
-restarts.
+ID and accepts event appends: retransmissions of an already-staged (or
+same-batch repeated) (replica_id, seq) are compared for full content
+equality only -- identical events are ignored, while different content
+(including a missing or extra-zero clock component or a changed self
+component) is a 409, never a 422.  Only genuinely new identities face the
+per-event checks (fields, replica membership, full clock coverage, self
+component == seq); missing predecessors or cross-replica dependencies are
+tolerated while staging and only fail at commit time.  The 120-event
+session capacity counts distinct identities alone, so a single append may
+carry any number of retransmissions.  Committing merges the staged events
+into the history's latest committed state with the original full-equality,
+causal and 120-event rules (content mismatch 409, missing dependencies or
+other violations 422) and closes the session; the merge and the close take
+effect in the same transaction, a failed commit leaves the open session and
+its staged events untouched for a retry, and a closed session rejects
+further appends and commits with 409.  Staging never affects the history
+reads or verdicts, and sessions persist in the same SQLite database, so
+they survive restarts.
 """
 
 from __future__ import annotations
@@ -244,6 +248,25 @@ class MergeEventsRequest(BaseModel):
     events: Annotated[
         list[Event],
         Field(min_length=1, max_length=120, description="1-120 events to merge, any order."),
+    ]
+
+
+class StageEventsRequest(BaseModel):
+    """Events appended to an import session; retransmissions are expected."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    events: Annotated[
+        list[Event],
+        Field(
+            min_length=1,
+            description=(
+                "Events to stage, any order and any count: retransmissions "
+                "of already-staged events are ignored, so one append may "
+                "carry more than 120 items as long as the distinct new "
+                "identities fit the session's 120-event capacity."
+            ),
+        ),
     ]
 
 
@@ -687,21 +710,43 @@ def _stage_events(
 ) -> list[Event]:
     """Stage incoming events into an open import session.
 
-    Only the per-event checks apply while staging: the event must belong to
-    one of the history's replicas, its clock must cover exactly all
-    replica_ids, and the clock's own component must equal the event's seq
-    (all 422).  Missing predecessors or cross-replica dependencies are
-    tolerated here and only fail when the session is committed.  Re-staging
-    an identical event (same identity and same full content, including
-    every clock component) is ignored; the same (replica_id, seq) with
-    different content is a 409.  A session stages at most 120 distinct
-    events.  Either the whole append applies or nothing does.
+    Retransmissions are recognised before any validation: an incoming event
+    whose (replica_id, seq) is already staged -- or already appeared earlier
+    in the same append -- is only compared for content equality (key,
+    operation, value and the *complete* clock, component order irrelevant).
+    Identical content is ignored; different content -- including a missing
+    clock component, an extra zero-valued component or a changed self
+    component -- is a 409, never a 422.
+
+    Genuinely new identities get the per-event checks only: the event must
+    belong to one of the history's replicas, its clock must cover exactly
+    all replica_ids, and the clock's own component must equal the event's
+    seq (all 422).  Missing predecessors or cross-replica dependencies are
+    tolerated here and only fail when the session is committed.
+
+    The 120-event capacity counts distinct identities only -- the events
+    already staged plus the new identities in this append -- so any number
+    of retransmissions rides along for free.  Either the whole append
+    applies or nothing does.
     """
 
     replica_set = set(replica_ids)
+    staged_by_id = {(ev.replica_id, ev.seq): ev for ev in staged}
 
-    errors: list[dict] = []
+    # Split the append into first occurrences (new identities, validated
+    # below) and retransmissions (content-checked only, in the merge pass).
+    first_occurrence: dict[tuple[str, int], Event] = {}
+    new_events: list[tuple[int, Event]] = []
     for i, ev in enumerate(incoming):
+        ident = (ev.replica_id, ev.seq)
+        if ident in staged_by_id or ident in first_occurrence:
+            continue
+        first_occurrence[ident] = ev
+        new_events.append((i, ev))
+
+    # Per-event checks on new identities only (422).
+    errors: list[dict] = []
+    for i, ev in new_events:
         if ev.replica_id not in replica_set:
             errors.append(
                 _err(
@@ -731,8 +776,9 @@ def _stage_events(
     if errors:
         raise BatchError(errors)
 
-    # Coverage is exact from here on, so the self-component lookup is safe.
-    for i, ev in enumerate(incoming):
+    # Coverage is exact for every new identity from here on, so the
+    # self-component lookup is safe.
+    for i, ev in new_events:
         if ev.clock[ev.replica_id] != ev.seq:
             raise BatchError(
                 [
@@ -745,10 +791,13 @@ def _stage_events(
                 ]
             )
 
-    staged_by_id = {(ev.replica_id, ev.seq): ev for ev in staged}
+    # Merge pass: a retransmission (already staged, or a repeat within this
+    # append) is ignored when identical and rejected with 409 when its
+    # content differs; new identities are appended.
+    known = dict(staged_by_id)
     merged = list(staged)
     for i, ev in enumerate(incoming):
-        prior = staged_by_id.get((ev.replica_id, ev.seq))
+        prior = known.get((ev.replica_id, ev.seq))
         if prior is not None:
             if not _same_event_content(prior, ev):
                 raise ConflictStateError(
@@ -768,7 +817,7 @@ def _stage_events(
                 )
             # Same identity, identical content -> ignore.
             continue
-        staged_by_id[(ev.replica_id, ev.seq)] = ev
+        known[(ev.replica_id, ev.seq)] = ev
         merged.append(ev)
 
     if len(merged) > 120:
@@ -1603,11 +1652,14 @@ def commit_history_conflict(history_id: str, body: ConflictDecision) -> dict:
 #
 # Sessions stage offline events that arrive in several batches; the staged
 # events only reach the persistent history when the session is committed.
-# Staging applies the per-event checks only (fields, replica membership,
-# full clock coverage, self component == seq) and tolerates not-yet-arrived
-# predecessors or cross-replica dependencies; commit re-runs the original
-# merge (full-content equality, causal validation, 120-event cap) against
-# the history's latest committed state.  Every mutation runs inside one
+# Staging recognises retransmissions of already-staged (or same-batch
+# repeated) identities first -- identical content is ignored, different
+# content is 409 -- and applies the per-event checks (fields, replica
+# membership, full clock coverage, self component == seq) only to genuinely
+# new identities, tolerating not-yet-arrived predecessors or cross-replica
+# dependencies; the 120-event capacity counts distinct identities only.
+# Commit re-runs the original merge (full-content equality, causal
+# validation, 120-event cap) against the history's latest committed state.  Every mutation runs inside one
 # BEGIN IMMEDIATE transaction together with the history row lock, so a
 # commit serialises with the legacy write endpoints and cannot lose events,
 # the merge and the session close take effect together, and any failure
@@ -1663,15 +1715,20 @@ def read_import_session(history_id: str, session_id: str) -> dict:
     response_model=None,
 )
 def stage_import_session_events(
-    history_id: str, session_id: str, body: MergeEventsRequest
+    history_id: str, session_id: str, body: StageEventsRequest
 ) -> dict:
     """Stage a batch of events into an open session and return its state.
 
-    Per-event checks only (422 on illegal fields, unknown replica, clock
-    coverage or self component); missing dependencies are tolerated until
-    commit.  Identical re-staging is ignored, the same identity with
-    different content is 409, and the 120-distinct-event session limit is
-    422.  A failed append changes nothing; a closed session is 409.
+    Retransmissions of already-staged (or same-batch repeated) identities
+    are compared for full content equality only: identical events are
+    ignored, different content -- a missing/extra-zero clock component, a
+    changed self component, a different key/op/value -- is 409.  Only
+    genuinely new identities face the per-event checks (422 on illegal
+    fields, unknown replica, clock coverage or self component); missing
+    dependencies are tolerated until commit.  The 120-event capacity counts
+    distinct identities only, so one append may carry any number of
+    retransmissions.  A failed append changes nothing; a closed session is
+    409.
     """
 
     with store.write_transaction() as conn:
